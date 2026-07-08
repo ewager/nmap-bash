@@ -1,0 +1,131 @@
+#!/usr/bin/env bash
+#
+# nmap_recon.sh
+# Script de reconocimiento de red con nmap (fase de recon en pentesting)
+#
+# Uso:
+#   ./nmap_recon.sh -t <IP_o_rango> [-o directorio_salida] [-f]
+#
+# Ejemplos:
+#   ./nmap_recon.sh -t 192.168.1.0/24
+#   ./nmap_recon.sh -t 10.10.10.5 -o resultados -f   # -f = full port scan (0-65535)
+#
+set -euo pipefail
+
+# ---------- Colores ----------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ---------- Variables por defecto ----------
+TARGET=""
+OUTDIR="recon_$(date +%Y%m%d_%H%M%S)"
+FULL_SCAN=false
+
+log()   { echo -e "${BLUE}[*]${NC} $1"; }
+ok()    { echo -e "${GREEN}[+]${NC} $1"; }
+warn()  { echo -e "${YELLOW}[!]${NC} $1"; }
+err()   { echo -e "${RED}[-]${NC} $1"; }
+
+usage() {
+    echo "Uso: $0 -t <objetivo> [-o directorio_salida] [-f]"
+    echo "  -t   IP, rango o dominio objetivo (obligatorio)"
+    echo "  -o   Carpeta donde guardar resultados (opcional)"
+    echo "  -f   Escaneo completo de puertos 0-65535 (opcional, mas lento)"
+    exit 1
+}
+
+# ---------- Parseo de argumentos ----------
+while getopts "t:o:fh" opt; do
+    case $opt in
+        t) TARGET="$OPTARG" ;;
+        o) OUTDIR="$OPTARG" ;;
+        f) FULL_SCAN=true ;;
+        h) usage ;;
+        *) usage ;;
+    esac
+done
+
+if [[ -z "$TARGET" ]]; then
+    err "Falta el objetivo (-t)"
+    usage
+fi
+
+# ---------- Verificaciones previas ----------
+if ! command -v nmap &> /dev/null; then
+    err "nmap no esta instalado. Instalalo con: sudo apt install nmap"
+    exit 1
+fi
+
+IS_ROOT=false
+if [[ $EUID -eq 0 ]]; then
+    IS_ROOT=true
+else
+    warn "No estas como root/sudo: se omitiran detección de SO (-O) y algunos scans SYN."
+fi
+
+mkdir -p "$OUTDIR"
+log "Objetivo:        $TARGET"
+log "Carpeta salida:  $OUTDIR"
+log "Escaneo completo de puertos: $FULL_SCAN"
+echo ""
+
+# ---------- 1. Descubrimiento de hosts (ping sweep) ----------
+log "1/5 Descubrimiento de hosts activos..."
+nmap -sn "$TARGET" -oA "$OUTDIR/1_host_discovery" 2>/dev/null
+ok "Guardado en $OUTDIR/1_host_discovery.*"
+echo ""
+
+# ---------- 2. Escaneo rápido de puertos (top 1000 o completo) ----------
+if [[ "$FULL_SCAN" == true ]]; then
+    log "2/5 Escaneo de TODOS los puertos (0-65535)... esto puede tardar"
+    PORT_ARG="-p-"
+else
+    log "2/5 Escaneo rápido de los 1000 puertos más comunes..."
+    PORT_ARG=""
+fi
+
+if [[ "$IS_ROOT" == true ]]; then
+    nmap -sS -T4 $PORT_ARG "$TARGET" -oA "$OUTDIR/2_port_scan" 2>/dev/null
+else
+    nmap -sT -T4 $PORT_ARG "$TARGET" -oA "$OUTDIR/2_port_scan" 2>/dev/null
+fi
+ok "Guardado en $OUTDIR/2_port_scan.*"
+echo ""
+
+# Extraer puertos abiertos para reutilizar en los siguientes escaneos
+OPEN_PORTS=$(grep -oP '\d+(?=/open)' "$OUTDIR/2_port_scan.gnmap" 2>/dev/null | sort -nu | tr '\n' ',' | sed 's/,$//')
+
+if [[ -z "$OPEN_PORTS" ]]; then
+    warn "No se detectaron puertos abiertos. Se omiten los pasos 3-5."
+else
+    ok "Puertos abiertos detectados: $OPEN_PORTS"
+    echo ""
+
+    # ---------- 3. Detección de versión de servicios ----------
+    log "3/5 Detección de versiones de servicios en puertos abiertos..."
+    nmap -sV -p "$OPEN_PORTS" -T4 "$TARGET" -oA "$OUTDIR/3_service_version" 2>/dev/null
+    ok "Guardado en $OUTDIR/3_service_version.*"
+    echo ""
+
+    # ---------- 4. Detección de sistema operativo ----------
+    if [[ "$IS_ROOT" == true ]]; then
+        log "4/5 Detección de sistema operativo..."
+        nmap -O "$TARGET" -oA "$OUTDIR/4_os_detection" 2>/dev/null
+        ok "Guardado en $OUTDIR/4_os_detection.*"
+    else
+        warn "4/5 Detección de SO omitida (requiere sudo)."
+    fi
+    echo ""
+
+    # ---------- 5. Scripts de reconocimiento y vulnerabilidades básicas ----------
+    log "5/5 Ejecutando scripts NSE (default + vuln) en puertos abiertos..."
+    nmap -sC --script vuln -p "$OPEN_PORTS" -T4 "$TARGET" -oA "$OUTDIR/5_scripts_vuln" 2>/dev/null
+    ok "Guardado en $OUTDIR/5_scripts_vuln.*"
+fi
+
+echo ""
+ok "Reconocimiento finalizado. Todos los resultados están en: $OUTDIR/"
+log "Formatos guardados por cada fase: .nmap (texto), .xml, .gnmap (grepable)"
