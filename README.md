@@ -1,2 +1,2 @@
 # nmap-bash
-ehollstein
+script en bash 
